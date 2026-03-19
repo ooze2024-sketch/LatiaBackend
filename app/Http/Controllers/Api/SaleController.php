@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Models\Sale;
 use App\Models\SaleItem;
 use App\Models\Product;
+use App\Models\StockMovement;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use App\Http\Controllers\Controller;
@@ -52,8 +53,10 @@ class SaleController extends Controller
                 'status' => 'paid',
             ]);
 
-            // Add sale items
+            // Add sale items and deduct ingredients from inventory
             foreach ($request->items as $item) {
+                $product = Product::find($item['product_id']);
+                
                 SaleItem::create([
                     'sale_id' => $sale->id,
                     'product_id' => $item['product_id'],
@@ -61,8 +64,11 @@ class SaleController extends Controller
                     'quantity' => $item['quantity'],
                     'unit_price' => $item['unit_price'],
                     'line_total' => $item['line_total'],
-                    'cost' => Product::find($item['product_id'])->cost,
+                    'cost' => $product->cost,
                 ]);
+
+                // Deduct linked ingredients from inventory
+                $this->deductProductIngredients($product, $item['quantity']);
             }
 
             return response()->json([
@@ -75,6 +81,33 @@ class SaleController extends Controller
                 'success' => false,
                 'message' => 'Error creating sale: ' . $e->getMessage(),
             ], Response::HTTP_INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    /**
+     * Deduct linked ingredients from inventory when a product is sold
+     */
+    private function deductProductIngredients(Product $product, $quantity)
+    {
+        $ingredients = $product->ingredients()->with('inventoryItem')->get();
+
+        foreach ($ingredients as $ingredient) {
+            $totalQuantityToDeduct = $ingredient->quantity * $quantity;
+            
+            $inventoryItem = $ingredient->inventoryItem;
+            if ($inventoryItem) {
+                $inventoryItem->decrement('quantity', $totalQuantityToDeduct);
+
+                // Record stock movement
+                StockMovement::create([
+                    'inventory_item_id' => $inventoryItem->id,
+                    'movement_type' => 'sale',
+                    'quantity' => $totalQuantityToDeduct,
+                    'unit_cost' => 0,
+                    'reference_id' => null,
+                    'notes' => 'Auto-deducted for sale of ' . $product->name,
+                ]);
+            }
         }
     }
 

@@ -91,4 +91,40 @@ class ProductController extends Controller
             'data' => $products,
         ]);
     }
+
+    public function uploadImage(Request $request, Product $product)
+    {
+        $request->validate([
+            'image' => 'required|image|mimes:jpeg,png,jpg,gif,webp|max:5120', // 5MB max
+        ]);
+
+        try {
+            // Delete old image if it exists
+            if ($product->image_path && \Storage::exists('public/' . $product->image_path)) {
+                \Storage::delete('public/' . $product->image_path);
+            }
+
+            // Store new image
+            $path = $request->file('image')->store('products', 'public');
+            
+            // Update product with image path
+            $product->update(['image_path' => $path]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Image uploaded successfully',
+                'data' => [
+                    'image_url' => url('storage/' . $path),
+                    'image_path' => $path,
+                    'product' => $product->load('category'),
+                ]
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to upload image: ' . $e->getMessage(),
+            ], Response::HTTP_INTERNAL_SERVER_ERROR);
+        }
+    }
 }

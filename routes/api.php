@@ -8,6 +8,7 @@ use App\Http\Controllers\Api\ProductController;
 use App\Http\Controllers\Api\InventoryController;
 use App\Http\Controllers\Api\SaleController;
 use App\Http\Controllers\Api\DashboardController;
+use App\Http\Controllers\Api\IngredientsController;
 
 Route::prefix('v1')->group(function () {
     // Public routes
@@ -24,6 +25,7 @@ Route::prefix('v1')->group(function () {
         // Products
         Route::apiResource('products', ProductController::class);
         Route::get('/products/category/{categoryId}', [ProductController::class, 'byCategory']);
+        Route::post('/products/{product}/upload-image', [ProductController::class, 'uploadImage']);
 
         // Inventory
         Route::apiResource('inventory', InventoryController::class);
@@ -39,5 +41,12 @@ Route::prefix('v1')->group(function () {
         // Dashboard
         Route::get('/dashboard/stats', [DashboardController::class, 'stats']);
         Route::get('/dashboard/sales-trend', [DashboardController::class, 'salesTrend']);
+
+        // Ingredients/Product Links
+        Route::post('/products/ingredients/batch', [IngredientsController::class, 'getMultipleProductsIngredients']);
+        Route::get('/products/{product}/ingredients', [IngredientsController::class, 'getProductIngredients']);
+        Route::post('/products/{product}/ingredients', [IngredientsController::class, 'linkIngredientsToProduct']);
+        Route::delete('/product-ingredients/{productIngredient}', [IngredientsController::class, 'deleteIngredientLink']);
+        Route::put('/product-ingredients/{productIngredient}', [IngredientsController::class, 'updateIngredientQuantity']);
     // });
 });

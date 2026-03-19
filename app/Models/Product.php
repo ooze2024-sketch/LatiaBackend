@@ -17,6 +17,7 @@ class Product extends Model
         'price',
         'description',
         'is_active',
+        'image_path',
     ];
 
     protected function casts(): array
@@ -41,5 +42,10 @@ class Product extends Model
     public function saleItems()
     {
         return $this->hasMany(SaleItem::class);
+    }
+
+    public function ingredients()
+    {
+        return $this->hasMany(ProductIngredient::class);
     }
 }
