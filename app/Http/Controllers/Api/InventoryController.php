@@ -7,12 +7,43 @@ use App\Models\StockMovement;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\Cache;
 
 class InventoryController extends Controller
 {
+    private const CATALOG_CACHE_TTL_SECONDS = 120;
+
+    private function getCatalogCacheVersion(): int
+    {
+        return (int) Cache::rememberForever('catalog:version', fn () => 1);
+    }
+
+    private function bumpCatalogCacheVersion(): void
+    {
+        $current = (int) Cache::get('catalog:version', 1);
+        Cache::forever('catalog:version', $current + 1);
+    }
+
     public function index()
     {
-        $items = InventoryItem::with('product')->get();
+        $cacheKey = 'inventory:index:v' . $this->getCatalogCacheVersion();
+
+        $items = Cache::remember($cacheKey, self::CATALOG_CACHE_TTL_SECONDS, function () {
+            return InventoryItem::query()
+                ->select([
+                    'id',
+                    'product_id',
+                    'name',
+                    'quantity',
+                    'unit',
+                    'reorder_level',
+                    'created_at',
+                    'updated_at',
+                ])
+                ->with(['product:id,name'])
+                ->orderBy('name')
+                ->get();
+        });
         
         return response()->json([
             'success' => true,
@@ -31,6 +62,7 @@ class InventoryController extends Controller
         ]);
 
         $item = InventoryItem::create($request->all());
+        $this->bumpCatalogCacheVersion();
 
         return response()->json([
             'success' => true,
@@ -57,6 +89,7 @@ class InventoryController extends Controller
         ]);
 
         $inventoryItem->update($request->only(['name', 'quantity', 'unit', 'reorder_level']));
+        $this->bumpCatalogCacheVersion();
 
         return response()->json([
             'success' => true,
@@ -68,6 +101,7 @@ class InventoryController extends Controller
     public function destroy(InventoryItem $inventoryItem)
     {
         $inventoryItem->delete();
+        $this->bumpCatalogCacheVersion();
 
         return response()->json([
             'success' => true,
@@ -93,6 +127,8 @@ class InventoryController extends Controller
         } else {
             $inventoryItem->increment('quantity', $request->quantity);
         }
+
+        $this->bumpCatalogCacheVersion();
 
         return response()->json([
             'success' => true,

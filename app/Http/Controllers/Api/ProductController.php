@@ -6,12 +6,46 @@ use App\Models\Product;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\Cache;
 
 class ProductController extends Controller
 {
+    private const CATALOG_CACHE_TTL_SECONDS = 120;
+
+    private function getCatalogCacheVersion(): int
+    {
+        return (int) Cache::rememberForever('catalog:version', fn () => 1);
+    }
+
+    private function bumpCatalogCacheVersion(): void
+    {
+        $current = (int) Cache::get('catalog:version', 1);
+        Cache::forever('catalog:version', $current + 1);
+    }
+
     public function index()
     {
-        $products = Product::with('category')->get();
+        $cacheKey = 'products:index:v' . $this->getCatalogCacheVersion();
+
+        $products = Cache::remember($cacheKey, self::CATALOG_CACHE_TTL_SECONDS, function () {
+            return Product::query()
+                ->select([
+                    'id',
+                    'sku',
+                    'name',
+                    'category_id',
+                    'cost',
+                    'price',
+                    'description',
+                    'is_active',
+                    'image_path',
+                    'created_at',
+                    'updated_at',
+                ])
+                ->with(['category:id,name'])
+                ->orderBy('name')
+                ->get();
+        });
         
         return response()->json([
             'success' => true,
@@ -32,6 +66,7 @@ class ProductController extends Controller
         ]);
 
         $product = Product::create($request->all());
+        $this->bumpCatalogCacheVersion();
 
         return response()->json([
             'success' => true,
@@ -61,6 +96,7 @@ class ProductController extends Controller
         ]);
 
         $product->update($request->all());
+        $this->bumpCatalogCacheVersion();
 
         return response()->json([
             'success' => true,
@@ -72,6 +108,7 @@ class ProductController extends Controller
     public function destroy(Product $product)
     {
         $product->delete();
+        $this->bumpCatalogCacheVersion();
 
         return response()->json([
             'success' => true,
@@ -109,6 +146,7 @@ class ProductController extends Controller
             
             // Update product with image path
             $product->update(['image_path' => $path]);
+            $this->bumpCatalogCacheVersion();
 
             return response()->json([
                 'success' => true,

@@ -7,9 +7,24 @@ use App\Models\ProductIngredient;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 
 class IngredientsController extends Controller
 {
+    private const CATALOG_CACHE_TTL_SECONDS = 120;
+
+    private function getCatalogCacheVersion(): int
+    {
+        return (int) Cache::rememberForever('catalog:version', fn () => 1);
+    }
+
+    private function bumpCatalogCacheVersion(): void
+    {
+        $current = (int) Cache::get('catalog:version', 1);
+        Cache::forever('catalog:version', $current + 1);
+    }
+
     /**
      * Get ingredients for multiple products in one request
      */
@@ -20,10 +35,54 @@ class IngredientsController extends Controller
             'product_ids.*' => 'integer|exists:products,id',
         ]);
 
-        $ingredients = ProductIngredient::whereIn('product_id', $request->product_ids)
-            ->with('inventoryItem')
-            ->get()
-            ->groupBy('product_id');
+        $productIds = collect($request->product_ids)
+            ->map(fn ($id) => (int) $id)
+            ->unique()
+            ->sort()
+            ->values()
+            ->all();
+
+        if (count($productIds) === 0) {
+            return response()->json([
+                'success' => true,
+                'data' => [],
+            ]);
+        }
+
+        $cacheKey = 'ingredients:batch:v' . $this->getCatalogCacheVersion() . ':' . md5(implode(',', $productIds));
+
+        $ingredients = Cache::remember($cacheKey, self::CATALOG_CACHE_TTL_SECONDS, function () use ($productIds) {
+            return DB::table('product_ingredients as pi')
+                ->join('inventory_items as ii', 'ii.id', '=', 'pi.inventory_item_id')
+                ->whereIn('pi.product_id', $productIds)
+                ->select([
+                    'pi.id',
+                    'pi.product_id',
+                    'pi.inventory_item_id',
+                    'pi.quantity',
+                    'ii.name as inventory_item_name',
+                    'ii.unit as inventory_item_unit',
+                ])
+                ->orderBy('pi.product_id')
+                ->orderBy('pi.id')
+                ->get()
+                ->groupBy('product_id')
+                ->map(function ($rows) {
+                    return $rows->map(function ($row) {
+                        return [
+                            'id' => (int) $row->id,
+                            'product_id' => (int) $row->product_id,
+                            'inventory_item_id' => (int) $row->inventory_item_id,
+                            'quantity' => (float) $row->quantity,
+                            'inventoryItem' => [
+                                'id' => (int) $row->inventory_item_id,
+                                'name' => $row->inventory_item_name,
+                                'unit' => $row->inventory_item_unit,
+                            ],
+                        ];
+                    })->values();
+                });
+        });
 
         return response()->json([
             'success' => true,
@@ -36,7 +95,15 @@ class IngredientsController extends Controller
      */
     public function getProductIngredients(Product $product)
     {
-        $ingredients = $product->ingredients()->with('inventoryItem')->get();
+        $cacheKey = 'ingredients:product:v' . $this->getCatalogCacheVersion() . ':' . $product->id;
+
+        $ingredients = Cache::remember($cacheKey, self::CATALOG_CACHE_TTL_SECONDS, function () use ($product) {
+            return $product->ingredients()
+                ->select(['id', 'product_id', 'inventory_item_id', 'quantity'])
+                ->with(['inventoryItem:id,name,unit'])
+                ->orderBy('id')
+                ->get();
+        });
 
         return response()->json([
             'success' => true,
@@ -56,22 +123,37 @@ class IngredientsController extends Controller
         ]);
 
         try {
-            // Delete existing ingredients for this product
-            $product->ingredients()->delete();
+            DB::transaction(function () use ($product, $request) {
+                // Delete existing ingredients for this product
+                $product->ingredients()->delete();
 
-            // Add new ingredients
-            foreach ($request->ingredients as $ingredient) {
-                ProductIngredient::create([
-                    'product_id' => $product->id,
-                    'inventory_item_id' => $ingredient['inventory_item_id'],
-                    'quantity' => $ingredient['quantity'],
-                ]);
-            }
+                $payload = collect($request->ingredients)
+                    ->map(function ($ingredient) use ($product) {
+                        return [
+                            'product_id' => $product->id,
+                            'inventory_item_id' => $ingredient['inventory_item_id'],
+                            'quantity' => $ingredient['quantity'],
+                            'created_at' => now(),
+                            'updated_at' => now(),
+                        ];
+                    })
+                    ->all();
+
+                if (count($payload) > 0) {
+                    ProductIngredient::insert($payload);
+                }
+            });
+
+            $this->bumpCatalogCacheVersion();
 
             return response()->json([
                 'success' => true,
                 'message' => 'Ingredients linked successfully',
-                'data' => $product->ingredients()->with('inventoryItem')->get(),
+                'data' => $product->ingredients()
+                    ->select(['id', 'product_id', 'inventory_item_id', 'quantity'])
+                    ->with(['inventoryItem:id,name,unit'])
+                    ->orderBy('id')
+                    ->get(),
             ]);
         } catch (\Exception $e) {
             return response()->json([
@@ -88,6 +170,7 @@ class IngredientsController extends Controller
     {
         try {
             $productIngredient->delete();
+            $this->bumpCatalogCacheVersion();
 
             return response()->json([
                 'success' => true,
@@ -112,6 +195,7 @@ class IngredientsController extends Controller
 
         try {
             $productIngredient->update(['quantity' => $request->quantity]);
+            $this->bumpCatalogCacheVersion();
 
             return response()->json([
                 'success' => true,
