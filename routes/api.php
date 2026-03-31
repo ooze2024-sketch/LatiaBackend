@@ -9,6 +9,7 @@ use App\Http\Controllers\Api\InventoryController;
 use App\Http\Controllers\Api\SaleController;
 use App\Http\Controllers\Api\DashboardController;
 use App\Http\Controllers\Api\IngredientsController;
+use Illuminate\Support\Facades\Cache;
 
 Route::prefix('v1')->group(function () {
     // Public routes
@@ -25,6 +26,7 @@ Route::prefix('v1')->group(function () {
         // Products
         Route::apiResource('products', ProductController::class);
         Route::get('/products/category/{categoryId}', [ProductController::class, 'byCategory']);
+        Route::get('/products/{product}/image', [ProductController::class, 'image']);
         Route::post('/products/{product}/upload-image', [ProductController::class, 'uploadImage']);
 
         // Inventory
@@ -41,6 +43,26 @@ Route::prefix('v1')->group(function () {
         // Dashboard
         Route::get('/dashboard/stats', [DashboardController::class, 'stats']);
         Route::get('/dashboard/sales-trend', [DashboardController::class, 'salesTrend']);
+
+        // Sync version (used by cashier/admin clients to detect catalog changes)
+        Route::get('/sync/version', function () {
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'catalog_version' => (int) Cache::rememberForever('catalog:version', fn () => 1),
+                    'timestamp' => now()->toIso8601String(),
+                ],
+            ]);
+        });
+        Route::get('/catalog/version', function () {
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'catalog_version' => (int) Cache::rememberForever('catalog:version', fn () => 1),
+                    'timestamp' => now()->toIso8601String(),
+                ],
+            ]);
+        });
 
         // Ingredients/Product Links
         Route::post('/products/ingredients/batch', [IngredientsController::class, 'getMultipleProductsIngredients']);

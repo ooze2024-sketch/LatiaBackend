@@ -6,12 +6,21 @@ use App\Models\Sale;
 use App\Models\SaleItem;
 use App\Models\Product;
 use App\Models\StockMovement;
+use App\Models\InventoryItem;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 
 class SaleController extends Controller
 {
+    private function bumpCatalogCacheVersion(): void
+    {
+        $current = (int) Cache::get('catalog:version', 1);
+        Cache::forever('catalog:version', $current + 1);
+    }
+
     public function index()
     {
         $sales = Sale::with(['user', 'customer', 'saleItems', 'payments'])
@@ -27,7 +36,7 @@ class SaleController extends Controller
     public function store(Request $request)
     {
         $request->validate([
-            'user_id' => 'required|exists:users,id',
+            'user_id' => 'nullable|exists:users,id',
             'customer_id' => 'nullable|exists:customers,id',
             'subtotal' => 'required|numeric|min:0',
             'discount' => 'nullable|numeric|min:0',
@@ -42,40 +51,54 @@ class SaleController extends Controller
         ]);
 
         try {
-            $sale = Sale::create([
-                'public_reference' => 'SL-' . date('YmdHis'),
-                'user_id' => $request->user_id,
-                'customer_id' => $request->customer_id,
-                'subtotal' => $request->subtotal,
-                'discount' => $request->discount ?? 0,
-                'tax' => $request->tax ?? 0,
-                'total' => $request->total,
-                'status' => 'paid',
-            ]);
-
-            // Add sale items and deduct ingredients from inventory
-            foreach ($request->items as $item) {
-                $product = Product::find($item['product_id']);
-                
-                SaleItem::create([
-                    'sale_id' => $sale->id,
-                    'product_id' => $item['product_id'],
-                    'name' => $item['name'],
-                    'quantity' => $item['quantity'],
-                    'unit_price' => $item['unit_price'],
-                    'line_total' => $item['line_total'],
-                    'cost' => $product->cost,
+            $sale = DB::transaction(function () use ($request) {
+                $sale = Sale::create([
+                    'public_reference' => 'SL-' . now()->format('YmdHisv'),
+                    'user_id' => $request->user_id,
+                    'customer_id' => $request->customer_id,
+                    'subtotal' => $request->subtotal,
+                    'discount' => $request->discount ?? 0,
+                    'tax' => $request->tax ?? 0,
+                    'total' => $request->total,
+                    'status' => 'paid',
                 ]);
 
-                // Deduct linked ingredients from inventory
-                $this->deductProductIngredients($product, $item['quantity']);
-            }
+                // Add sale items and deduct ingredients from inventory
+                foreach ($request->items as $item) {
+                    $product = Product::find($item['product_id']);
+                    if (!$product) {
+                        throw new \RuntimeException('Product not found for sale item.');
+                    }
+
+                    SaleItem::create([
+                        'sale_id' => $sale->id,
+                        'product_id' => $item['product_id'],
+                        'name' => $item['name'],
+                        'quantity' => $item['quantity'],
+                        'unit_price' => $item['unit_price'],
+                        'line_total' => $item['line_total'],
+                        'cost' => $product->cost,
+                    ]);
+
+                    // Deduct linked ingredients from inventory
+                    $this->deductProductIngredients($product, $item['quantity'], $sale->id);
+                }
+
+                return $sale;
+            });
+
+            $this->bumpCatalogCacheVersion();
 
             return response()->json([
                 'success' => true,
                 'message' => 'Sale recorded successfully',
                 'data' => $sale->load(['user', 'customer', 'saleItems', 'payments']),
             ], Response::HTTP_CREATED);
+        } catch (\DomainException $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], Response::HTTP_UNPROCESSABLE_ENTITY);
         } catch (\Exception $e) {
             return response()->json([
                 'success' => false,
@@ -87,7 +110,7 @@ class SaleController extends Controller
     /**
      * Deduct linked ingredients from inventory when a product is sold
      */
-    private function deductProductIngredients(Product $product, $quantity)
+    private function deductProductIngredients(Product $product, $quantity, int $saleId)
     {
         $ingredients = $product->ingredients()->with('inventoryItem')->get();
 
@@ -96,15 +119,35 @@ class SaleController extends Controller
             
             $inventoryItem = $ingredient->inventoryItem;
             if ($inventoryItem) {
-                $inventoryItem->decrement('quantity', $totalQuantityToDeduct);
+                $lockedInventoryItem = InventoryItem::query()
+                    ->whereKey($inventoryItem->id)
+                    ->lockForUpdate()
+                    ->first();
+
+                if (!$lockedInventoryItem) {
+                    continue;
+                }
+
+                if ((float) $lockedInventoryItem->quantity < (float) $totalQuantityToDeduct) {
+                    throw new \DomainException(
+                        sprintf(
+                            'Insufficient inventory for ingredient: %s (needed %.3f, available %.3f)',
+                            $lockedInventoryItem->name,
+                            (float) $totalQuantityToDeduct,
+                            (float) $lockedInventoryItem->quantity,
+                        )
+                    );
+                }
+
+                $lockedInventoryItem->decrement('quantity', $totalQuantityToDeduct);
 
                 // Record stock movement
                 StockMovement::create([
-                    'inventory_item_id' => $inventoryItem->id,
+                    'inventory_item_id' => $lockedInventoryItem->id,
                     'movement_type' => 'sale',
                     'quantity' => $totalQuantityToDeduct,
                     'unit_cost' => 0,
-                    'reference_id' => null,
+                    'reference_id' => $saleId,
                     'notes' => 'Auto-deducted for sale of ' . $product->name,
                 ]);
             }

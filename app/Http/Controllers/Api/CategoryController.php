@@ -6,9 +6,16 @@ use App\Models\Category;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\Cache;
 
 class CategoryController extends Controller
 {
+    private function bumpCatalogCacheVersion(): void
+    {
+        $current = (int) Cache::get('catalog:version', 1);
+        Cache::forever('catalog:version', $current + 1);
+    }
+
     public function index()
     {
         $categories = Category::withCount('products')->get();
@@ -27,6 +34,7 @@ class CategoryController extends Controller
         ]);
 
         $category = Category::create($request->all());
+        $this->bumpCatalogCacheVersion();
 
         return response()->json([
             'success' => true,
@@ -51,6 +59,7 @@ class CategoryController extends Controller
         ]);
 
         $category->update($request->all());
+        $this->bumpCatalogCacheVersion();
 
         return response()->json([
             'success' => true,
@@ -62,6 +71,7 @@ class CategoryController extends Controller
     public function destroy(Category $category)
     {
         $category->delete();
+        $this->bumpCatalogCacheVersion();
 
         return response()->json([
             'success' => true,

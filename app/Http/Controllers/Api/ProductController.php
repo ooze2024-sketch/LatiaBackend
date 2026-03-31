@@ -7,6 +7,7 @@ use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Storage;
 
 class ProductController extends Controller
 {
@@ -21,6 +22,74 @@ class ProductController extends Controller
     {
         $current = (int) Cache::get('catalog:version', 1);
         Cache::forever('catalog:version', $current + 1);
+    }
+
+    private function resolveAvailableQuantity(Product $product): ?int
+    {
+        $ingredients = $product->ingredients;
+        if ($ingredients->isEmpty()) {
+            return null;
+        }
+
+        $availableQuantity = null;
+
+        foreach ($ingredients as $ingredient) {
+            $requiredPerProduct = (float) $ingredient->quantity;
+            if ($requiredPerProduct <= 0) {
+                continue;
+            }
+
+            $inventoryQuantity = (float) optional($ingredient->inventoryItem)->quantity;
+            $possibleUnits = (int) floor($inventoryQuantity / $requiredPerProduct);
+
+            $availableQuantity = is_null($availableQuantity)
+                ? $possibleUnits
+                : min($availableQuantity, $possibleUnits);
+        }
+
+        return max(0, $availableQuantity ?? 0);
+    }
+
+    private function serializeProduct(Product $product, bool $includeInventoryItems = false): array
+    {
+        $data = [
+            'id' => $product->id,
+            'sku' => $product->sku,
+            'name' => $product->name,
+            'category_id' => $product->category_id,
+            'category' => $product->category
+                ? [
+                    'id' => $product->category->id,
+                    'name' => $product->category->name,
+                ]
+                : null,
+            'cost' => $product->cost,
+            'price' => $product->price,
+            'description' => $product->description,
+            'is_active' => (bool) $product->is_active,
+            'image_path' => $product->image_path,
+            'image_url' => $product->image_path
+                ? url('/api/v1/products/' . $product->id . '/image')
+                : null,
+            'available_quantity' => $this->resolveAvailableQuantity($product),
+            'created_at' => $product->created_at?->toIso8601String(),
+            'updated_at' => $product->updated_at?->toIso8601String(),
+        ];
+
+        if ($includeInventoryItems) {
+            $data['inventory_items'] = $product->inventoryItems->map(function ($item) {
+                return [
+                    'id' => $item->id,
+                    'product_id' => $item->product_id,
+                    'name' => $item->name,
+                    'quantity' => (float) $item->quantity,
+                    'unit' => $item->unit,
+                    'reorder_level' => (float) $item->reorder_level,
+                ];
+            })->values();
+        }
+
+        return $data;
     }
 
     public function index()
@@ -42,9 +111,16 @@ class ProductController extends Controller
                     'created_at',
                     'updated_at',
                 ])
-                ->with(['category:id,name'])
+                ->with([
+                    'category:id,name',
+                    'ingredients:id,product_id,inventory_item_id,quantity',
+                    'ingredients.inventoryItem:id,quantity',
+                ])
                 ->orderBy('name')
-                ->get();
+                ->get()
+                ->map(fn (Product $product) => $this->serializeProduct($product))
+                ->values()
+                ->all();
         });
         
         return response()->json([
@@ -66,20 +142,32 @@ class ProductController extends Controller
         ]);
 
         $product = Product::create($request->all());
+        $product->load([
+            'category:id,name',
+            'ingredients:id,product_id,inventory_item_id,quantity',
+            'ingredients.inventoryItem:id,quantity',
+        ]);
         $this->bumpCatalogCacheVersion();
 
         return response()->json([
             'success' => true,
             'message' => 'Product created successfully',
-            'data' => $product->load('category'),
+            'data' => $this->serializeProduct($product),
         ], Response::HTTP_CREATED);
     }
 
     public function show(Product $product)
     {
+        $product->load([
+            'category:id,name',
+            'inventoryItems:id,product_id,name,quantity,unit,reorder_level',
+            'ingredients:id,product_id,inventory_item_id,quantity',
+            'ingredients.inventoryItem:id,quantity',
+        ]);
+
         return response()->json([
             'success' => true,
-            'data' => $product->load(['category', 'inventoryItems']),
+            'data' => $this->serializeProduct($product, true),
         ]);
     }
 
@@ -96,12 +184,17 @@ class ProductController extends Controller
         ]);
 
         $product->update($request->all());
+        $product->load([
+            'category:id,name',
+            'ingredients:id,product_id,inventory_item_id,quantity',
+            'ingredients.inventoryItem:id,quantity',
+        ]);
         $this->bumpCatalogCacheVersion();
 
         return response()->json([
             'success' => true,
             'message' => 'Product updated successfully',
-            'data' => $product->load('category'),
+            'data' => $this->serializeProduct($product),
         ]);
     }
 
@@ -120,12 +213,43 @@ class ProductController extends Controller
     {
         $products = Product::where('category_id', $categoryId)
             ->where('is_active', true)
-            ->with('category')
-            ->get();
+            ->with([
+                'category:id,name',
+                'ingredients:id,product_id,inventory_item_id,quantity',
+                'ingredients.inventoryItem:id,quantity',
+            ])
+            ->get()
+            ->map(fn (Product $product) => $this->serializeProduct($product))
+            ->values();
 
         return response()->json([
             'success' => true,
             'data' => $products,
+        ]);
+    }
+
+    public function image(Product $product)
+    {
+        if (!$product->image_path) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Product image not found.',
+            ], Response::HTTP_NOT_FOUND);
+        }
+
+        $disk = Storage::disk('public');
+        if (!$disk->exists($product->image_path)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Product image file not found.',
+            ], Response::HTTP_NOT_FOUND);
+        }
+
+        $mimeType = $disk->mimeType($product->image_path) ?: 'application/octet-stream';
+
+        return response($disk->get($product->image_path), Response::HTTP_OK, [
+            'Content-Type' => $mimeType,
+            'Cache-Control' => 'public, max-age=3600',
         ]);
     }
 
@@ -146,15 +270,20 @@ class ProductController extends Controller
             
             // Update product with image path
             $product->update(['image_path' => $path]);
+            $product->load([
+                'category:id,name',
+                'ingredients:id,product_id,inventory_item_id,quantity',
+                'ingredients.inventoryItem:id,quantity',
+            ]);
             $this->bumpCatalogCacheVersion();
 
             return response()->json([
                 'success' => true,
                 'message' => 'Image uploaded successfully',
                 'data' => [
-                    'image_url' => url('storage/' . $path),
+                    'image_url' => url('/api/v1/products/' . $product->id . '/image'),
                     'image_path' => $path,
-                    'product' => $product->load('category'),
+                    'product' => $this->serializeProduct($product),
                 ]
             ]);
 
